@@ -1,12 +1,9 @@
-use actix_web::rt::time::interval;
 use actix_web::{web, HttpRequest, HttpResponse};
 use bytes::Bytes;
-use futures::stream;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use std::time::Duration;
-use tokio::sync::mpsc;
-use tokio_stream::wrappers::ReceiverStream;
+use tokio_stream::wrappers::UnboundedReceiverStream;
+use tokio_stream::StreamExt;
 use tracing::{debug, error, info};
 
 use crate::middleware::check_auth;
@@ -24,6 +21,7 @@ pub struct ChatMessage {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct ChatCompletionRequest {
     pub model: Option<String>,
     pub messages: Vec<ChatMessage>,
@@ -56,6 +54,7 @@ pub struct ChatCompletionRequest {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct CompletionRequest {
     pub model: Option<String>,
     pub prompt: StringOrArray,
@@ -517,7 +516,9 @@ pub async fn chat_completions(
     let prompt = apply_template(&req.messages, &template);
 
     if is_stream {
-        return stream_chat_response(engine, prompt, params, id, model).await;
+        drop(engine);
+        let state_arc: Arc<AppState> = state.as_ref().clone();
+        return stream_chat_response(state_arc, prompt, params, id, model).await;
     }
 
     // Non-streaming
@@ -573,17 +574,18 @@ pub async fn chat_completions(
 /// Generation runs in a background task, tokens are sent through an mpsc channel,
 /// and we stream them as SSE events to the client in real time.
 async fn stream_chat_response(
-    mut engine: tokio::sync::MutexGuard<'_, crate::model::ModelEngine>,
+    state: Arc<AppState>,
     prompt: String,
     params: GenParams,
     id: String,
     model: String,
 ) -> HttpResponse {
-    let (tx, rx) = mpsc::channel::<Bytes>(64);
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Result<Bytes, String>>();
     let created = chrono::Utc::now().timestamp();
 
     // Spawn generation in a blocking task to not block the event loop
     let _handle = tokio::task::spawn_blocking(move || {
+        let mut engine = state.engine.blocking_lock();
         // Send initial role chunk
         let role_chunk = ChatCompletionChunk {
             id: id.clone(),
@@ -599,7 +601,7 @@ async fn stream_chat_response(
                 finish_reason: None,
             }],
         };
-        let _ = tx.try_send(sse_line(&role_chunk));
+        let _ = tx.send(Ok(sse_line(&role_chunk)));
 
         let id_clone = id.clone();
         let model_clone = model.clone();
@@ -631,7 +633,7 @@ async fn stream_chat_response(
                         finish_reason: None,
                     }],
                 };
-                tx_clone.try_send(sse_line(&chunk)).is_ok()
+                tx_clone.send(Ok(sse_line(&chunk))).is_ok()
             },
         );
 
@@ -651,16 +653,17 @@ async fn stream_chat_response(
                     finish_reason: Some(r.finish_reason.clone()),
                 }],
             };
-            let _ = tx.try_send(sse_line(&final_chunk));
+            let _ = tx.send(Ok(sse_line(&final_chunk)));
         }
-        let _ = tx.try_send(sse_done());
+        let _ = tx.send(Ok(sse_done()));
         
         // Explicitly drop the sender to signal end of stream
         drop(tx);
     });
 
-    // Convert the receiver into a stream
-    let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+    // Convert the receiver into a stream and map String errors to actix_web::Error
+    let stream = UnboundedReceiverStream::new(rx)
+        .map(|result| result.map_err(|err| actix_web::error::ErrorInternalServerError(err)));
 
     HttpResponse::Ok()
         .content_type("text/event-stream")
@@ -709,7 +712,9 @@ pub async fn completions(
     let mut engine = state.engine.lock().await;
 
     if is_stream {
-        return stream_completion_response(engine, prompt, params, id, model).await;
+        drop(engine);
+        let state_arc: Arc<AppState> = state.as_ref().clone();
+        return stream_completion_response(state_arc, prompt, params, id, model).await;
     }
 
     match engine.generate(
@@ -758,17 +763,18 @@ pub async fn completions(
 }
 
 async fn stream_completion_response(
-    mut engine: tokio::sync::MutexGuard<'_, crate::model::ModelEngine>,
+    state: Arc<AppState>,
     prompt: String,
     params: GenParams,
     id: String,
     model: String,
 ) -> HttpResponse {
-    let (tx, rx) = mpsc::channel::<Bytes>(64);
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Result<Bytes, String>>();
     let created = chrono::Utc::now().timestamp();
 
     // Spawn generation in a blocking task to not block the event loop
     let _handle = tokio::task::spawn_blocking(move || {
+        let mut engine = state.engine.blocking_lock();
         let id_clone = id.clone();
         let model_clone = model.clone();
         let tx_clone = tx.clone();
@@ -795,7 +801,7 @@ async fn stream_completion_response(
                         finish_reason: None,
                     }],
                 };
-                tx_clone.try_send(sse_line(&chunk)).is_ok()
+                tx_clone.send(Ok(sse_line(&chunk))).is_ok()
             },
         );
 
@@ -811,16 +817,17 @@ async fn stream_completion_response(
                     finish_reason: Some(r.finish_reason.clone()),
                 }],
             };
-            let _ = tx.try_send(sse_line(&final_chunk));
+            let _ = tx.send(Ok(sse_line(&final_chunk)));
         }
-        let _ = tx.try_send(sse_done());
+        let _ = tx.send(Ok(sse_done()));
         
         // Explicitly drop the sender to signal end of stream
         drop(tx);
     });
 
-    // Convert the receiver into a stream
-    let stream = ReceiverStream::new(rx);
+    // Convert the receiver into a stream and map String errors to actix_web::Error
+    let stream = UnboundedReceiverStream::new(rx)
+        .map(|result| result.map_err(|err| actix_web::error::ErrorInternalServerError(err)));
 
     HttpResponse::Ok()
         .content_type("text/event-stream")

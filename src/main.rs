@@ -7,7 +7,9 @@ mod tokenizer_utils;
 use actix_cors::Cors;
 use actix_web::{web, App, HttpServer, middleware as actix_middleware};
 use clap::Parser;
+use hf_hub::{api::tokio::Api, Repo, RepoType};
 use model::ModelEngine;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 use tracing::{info, warn};
@@ -21,12 +23,24 @@ use tracing_subscriber::EnvFilter;
 )]
 pub struct Args {
     /// Path to the GGUF model file
-    #[arg(short, long)]
-    model: String,
+    #[arg(short, long, conflicts_with = "hf_model")]
+    model: Option<String>,
 
-    /// Path to the tokenizer.json file
+    /// Hugging Face model ID to download (e.g., microsoft/phi-2)
+    #[arg(long, conflicts_with = "model")]
+    hf_model: Option<String>,
+
+    /// Path to the tokenizer.json file (optional if downloading from HF)
     #[arg(short, long)]
-    tokenizer: String,
+    tokenizer: Option<String>,
+
+    /// Name of the GGUF file to download from Hugging Face (default: auto-detect by quantization)
+    #[arg(long, default_value = "")]
+    hf_filename: String,
+
+    /// Preferred quantization when auto-selecting GGUF file (e.g., Q4_K_M, Q5_K_M, Q8_0)
+    #[arg(long, default_value = "Q4_K_M")]
+    hf_quant: String,
 
     /// Host to bind
     #[arg(long, default_value = "0.0.0.0")]
@@ -112,10 +126,6 @@ async fn main() -> std::io::Result<()> {
         .init();
 
     info!("candle-gguf-server v{}", env!("CARGO_PKG_VERSION"));
-    info!("Model path  : {}", args.model);
-    info!("Tokenizer   : {}", args.tokenizer);
-    info!("Device      : {}", args.device);
-    info!("Max concurrent: {}", args.max_concurrent);
 
     let threads = if args.threads == 0 {
         num_cpus::get()
@@ -129,7 +139,31 @@ async fn main() -> std::io::Result<()> {
 
     let device = build_device(&args);
 
-    let engine = ModelEngine::new(&args.model, &args.tokenizer, &device, args.ctx_len)
+    // Handle model loading (either local file or from Hugging Face)
+    let (model_path, tokenizer_path) = if let Some(hf_model_id) = &args.hf_model {
+        // Download model from Hugging Face
+        let (model_path, tokenizer_path) = download_hf_model(hf_model_id, &args.hf_filename, &args.hf_quant).await
+            .expect("Failed to download model from Hugging Face");
+        
+        info!("Model path  : {}", model_path.display());
+        info!("Tokenizer   : {}", tokenizer_path.display());
+        
+        (model_path.to_string_lossy().to_string(), tokenizer_path.to_string_lossy().to_string())
+    } else {
+        // Use local model file
+        let model_path = args.model.as_ref().expect("--model or --hf-model must be provided");
+        let tokenizer_path = args.tokenizer.as_ref().expect("--tokenizer must be provided when using --model");
+        
+        info!("Model path  : {}", model_path);
+        info!("Tokenizer   : {}", tokenizer_path);
+        
+        (model_path.clone(), tokenizer_path.clone())
+    };
+
+    info!("Device      : {}", args.device);
+    info!("Max concurrent: {}", args.max_concurrent);
+
+    let engine = ModelEngine::new(&model_path, &tokenizer_path, &device, args.ctx_len)
         .expect("Failed to load model");
 
     info!(
@@ -189,6 +223,100 @@ async fn main() -> std::io::Result<()> {
     .bind(&bind_addr)?
     .run()
     .await
+}
+
+async fn download_hf_model(model_id: &str, hf_filename: &str, preferred_quant: &str) -> anyhow::Result<(PathBuf, PathBuf)> {
+    let api = Api::new()?;
+    let repo = Repo::new(model_id.to_string(), RepoType::Model);
+    
+    // If no specific filename provided, look for .gguf files in the repository
+    let gguf_filename = if hf_filename.is_empty() {
+        let repo_info = api.repo(repo.clone()).info().await
+            .map_err(|e| anyhow::anyhow!("Failed to get repo info for {}: {}", model_id, e))?;
+        
+        let gguf_files: Vec<&str> = repo_info.siblings
+            .iter()
+            .map(|s| s.rfilename.as_str())
+            .filter(|name| name.ends_with(".gguf"))
+            .collect();
+        
+        match gguf_files.len() {
+            0 => return Err(anyhow::anyhow!(
+                "No .gguf files found in repository '{}'. This repo may not contain GGUF-format models. \
+                 Try a GGUF-specific repo (e.g. 'TheBloke/phi-2-GGUF') or specify --hf-filename.",
+                model_id
+            )),
+            1 => gguf_files[0].to_string(),
+            _ => {
+                info!("Found {} GGUF files, looking for '{}' quantization", gguf_files.len(), preferred_quant);
+                let quant_lower = preferred_quant.to_lowercase();
+                let selected = gguf_files.iter()
+                    .find(|f| f.to_lowercase().contains(&quant_lower))
+                    .or_else(|| gguf_files.first())
+                    .unwrap()
+                    .to_string();
+                info!("Selected: {}", selected);
+                selected
+            }
+        }
+    } else {
+        hf_filename.to_string()
+    };
+    
+    info!("Downloading GGUF model file: {}", gguf_filename);
+    let model_path = api.repo(repo.clone()).get(&gguf_filename).await
+        .map_err(|e| anyhow::anyhow!("Failed to download model {}: {}", gguf_filename, e))?;
+
+    // Try to download the tokenizer as well
+    let tokenizer_path = match api.repo(repo.clone()).get("tokenizer.json").await {
+        Ok(path) => {
+            info!("Found and downloaded tokenizer.json from Hugging Face repo");
+            path
+        },
+        Err(_) => {
+            // Try alternative tokenizer files
+            let alt_files = ["tokenizer.model", "vocab.json"];
+            let mut found_tokenizer = None;
+            
+            for &filename in &alt_files {
+                if let Ok(path) = api.repo(repo.clone()).get(filename).await {
+                    info!("Found and downloaded {} from Hugging Face repo", filename);
+                    found_tokenizer = Some(path);
+                    break;
+                }
+            }
+            
+            if let Some(tokenizer_path) = found_tokenizer {
+                tokenizer_path
+            } else {
+                // If no tokenizer found, look for config to possibly generate one or warn
+                warn!("No tokenizer found in Hugging Face repo. Looking for config...");
+                
+                // Attempt to download config.json to see if we can extract tokenizer info
+                if let Ok(_config_path) = api.repo(repo.clone()).get("config.json").await {
+                    info!("Found config.json in Hugging Face repo");
+                    // For now, we still need a tokenizer file, so we'll use the one in the model directory
+                    // or prompt the user to provide one
+                }
+                
+                // Create a path for tokenizer in the same directory as the model
+                let mut tokenizer_path = model_path.clone();
+                tokenizer_path.set_file_name("tokenizer.json");
+                
+                // Check if tokenizer exists in the same directory as the model file
+                if !tokenizer_path.exists() {
+                    return Err(anyhow::anyhow!(
+                        "No tokenizer found in the Hugging Face repo and no tokenizer provided. \
+                         Please ensure tokenizer.json exists or provide one manually."
+                    ));
+                }
+                
+                tokenizer_path
+            }
+        }
+    };
+
+    Ok((model_path, tokenizer_path))
 }
 
 fn build_device(args: &Args) -> candle_core::Device {

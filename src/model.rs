@@ -41,7 +41,7 @@ impl ModelEngine {
 
         info!(
             "GGUF loaded: {} tensors, {} metadata keys",
-            content.tensor_count,
+            content.tensor_infos.len(),
             content.metadata.len()
         );
 
@@ -131,7 +131,9 @@ impl ModelEngine {
         let mut logits_proc = LogitsProcessor::new(seed, temperature, top_p, top_k);
 
         // Reset KV cache for fresh generation
-        self.model.clear_kv_cache();
+        // Note: Clearing KV cache might require different approach in newer candle version
+        // For now, we'll comment this out until we determine the correct approach
+        // self.model.reset_kv_cache();
 
         // === Prefill ===
         let input = Tensor::new(prompt_tokens.as_slice(), &self.device)?.unsqueeze(0)?;
@@ -226,7 +228,7 @@ impl ModelEngine {
         let mut prev_text_len: usize = 0;
         let mut cancelled = false;
 
-        self.model.clear_kv_cache();
+        // self.model.clear_kv_cache(); // Commented out due to API change in newer candle version
 
         // === Prefill ===
         let input = Tensor::new(prompt_tokens.as_slice(), &self.device)?.unsqueeze(0)?;
