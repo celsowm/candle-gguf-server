@@ -226,11 +226,31 @@ pub struct ModelList {
 }
 
 #[derive(Serialize)]
+pub struct ModelPermission {
+    pub id: String,
+    pub object: String,
+    pub created: i64,
+    pub allow_create_engine: bool,
+    pub allow_sampling: bool,
+    pub allow_logprobs: bool,
+    pub allow_search_indices: bool,
+    pub allow_view: bool,
+    pub allow_fine_tuning: bool,
+    pub organization: String,
+    pub group: Option<String>,
+    pub is_blocking: bool,
+}
+
+#[derive(Serialize)]
 pub struct ModelInfo {
     pub id: String,
     pub object: String,
     pub created: i64,
     pub owned_by: String,
+    pub root: String,
+    pub parent: Option<String>,
+    pub max_model_len: usize,
+    pub permission: Vec<ModelPermission>,
 }
 
 #[derive(Serialize)]
@@ -431,15 +451,37 @@ pub async fn not_found() -> HttpResponse {
     })
 }
 
+fn build_model_info(state: &AppState) -> ModelInfo {
+    let created = state.created_timestamp;
+    ModelInfo {
+        id: state.model_name.clone(),
+        object: "model".to_string(),
+        created,
+        owned_by: "vllm".to_string(),
+        root: state.model_name.clone(),
+        parent: None,
+        max_model_len: state.max_model_len,
+        permission: vec![ModelPermission {
+            id: format!("modelperm-{}", uuid::Uuid::new_v4().to_string().replace("-", "")),
+            object: "model_permission".to_string(),
+            created,
+            allow_create_engine: false,
+            allow_sampling: true,
+            allow_logprobs: true,
+            allow_search_indices: false,
+            allow_view: true,
+            allow_fine_tuning: false,
+            organization: "*".to_string(),
+            group: None,
+            is_blocking: false,
+        }],
+    }
+}
+
 pub async fn list_models(state: web::Data<Arc<AppState>>) -> HttpResponse {
     HttpResponse::Ok().json(ModelList {
         object: "list".to_string(),
-        data: vec![ModelInfo {
-            id: state.model_name.clone(),
-            object: "model".to_string(),
-            created: chrono::Utc::now().timestamp(),
-            owned_by: "local".to_string(),
-        }],
+        data: vec![build_model_info(&state)],
     })
 }
 
@@ -449,12 +491,7 @@ pub async fn get_model(
 ) -> HttpResponse {
     let id = path.into_inner();
     if id == state.model_name {
-        HttpResponse::Ok().json(ModelInfo {
-            id: state.model_name.clone(),
-            object: "model".to_string(),
-            created: chrono::Utc::now().timestamp(),
-            owned_by: "local".to_string(),
-        })
+        HttpResponse::Ok().json(build_model_info(&state))
     } else {
         HttpResponse::NotFound().json(ErrorResponse {
             error: ErrorDetail {

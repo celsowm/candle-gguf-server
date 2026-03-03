@@ -1,0 +1,22 @@
+[2m2026-03-03T23:18:43.074761Z[0m [32m INFO[0m ThreadId(01) candle-gguf-server v0.2.0
+[2m2026-03-03T23:18:43.091456Z[0m [32m INFO[0m ThreadId(01) CPU threads : 12
+[2m2026-03-03T23:18:43.091947Z[0m [32m INFO[0m ThreadId(01) Using CPU device
+[2m2026-03-03T23:18:43.092389Z[0m [32m INFO[0m ThreadId(01) Model path  : C:\Users\celso\.cache\huggingface\hub\models--TheBloke--phi-2-GGUF\snapshots\5a454d977c6438bb9fb2df233c8ca70f21c87420\phi-2.Q4_K_M.gguf
+[2m2026-03-03T23:18:43.092833Z[0m [32m INFO[0m ThreadId(01) Tokenizer   : embedded in GGUF
+[2m2026-03-03T23:18:43.093279Z[0m [32m INFO[0m ThreadId(01) Device      : auto
+[2m2026-03-03T23:18:43.093694Z[0m [32m INFO[0m ThreadId(01) Max concurrent: 1
+[2m2026-03-03T23:18:43.606915Z[0m [32m INFO[0m ThreadId(01) GGUF loaded: 325 tensors, 20 metadata keys
+[2m2026-03-03T23:18:43.612564Z[0m [32m INFO[0m ThreadId(01) Context length: 2048
+[2m2026-03-03T23:18:43.613029Z[0m [32m INFO[0m ThreadId(01) GGUF metadata: general.name = String("Phi2")
+[2m2026-03-03T23:18:43.613284Z[0m [32m INFO[0m ThreadId(01) GGUF metadata: general.architecture = String("phi2")
+[2m2026-03-03T23:18:43.613788Z[0m [32m INFO[0m ThreadId(01) GGUF metadata: general.quantization_version = U32(2)
+[2m2026-03-03T23:18:43.614073Z[0m [32m INFO[0m ThreadId(01) GGUF metadata: general.file_type = U32(15)
+[2m2026-03-03T23:18:43.614512Z[0m [32m INFO[0m ThreadId(01) Extracting tokenizer from GGUF metadata
+[2m2026-03-03T23:18:43.662771Z[0m [32m INFO[0m ThreadId(01) Detected architecture: phi2
+[2m2026-03-03T23:18:44.895091Z[0m [33m WARN[0m ThreadId(01) No EOS token found in tokenizer vocabulary!
+[2m2026-03-03T23:18:44.906725Z[0m [32m INFO[0m ThreadId(01) Model loaded — vocab size: 51200, ctx_len: 2048
+[2m2026-03-03T23:18:44.907146Z[0m [32m INFO[0m ThreadId(01) Listening on http://0.0.0.0:8099
+[2m2026-03-03T23:18:44.908843Z[0m [32m INFO[0m ThreadId(01) starting 12 workers
+[2m2026-03-03T23:18:44.909335Z[0m [32m INFO[0m ThreadId(01) Actix runtime found; starting in Actix runtime
+[2m2026-03-03T23:18:44.909628Z[0m [32m INFO[0m ThreadId(01) starting service: "actix-web-service-0.0.0.0:8099", workers: 12, listening on: 0.0.0.0:8099
+[2m2026-03-03T23:18:58.125326Z[0m [32m INFO[0m ThreadId(02) 127.0.0.1 "GET /v1/models HTTP/1.1" 500 96 0.086100ms

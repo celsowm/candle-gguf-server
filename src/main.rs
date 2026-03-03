@@ -6,6 +6,7 @@ mod tokenizer_utils;
 
 use actix_cors::Cors;
 use actix_web::{web, App, HttpServer, middleware as actix_middleware};
+use chrono::Utc;
 use clap::Parser;
 use hf_hub::{api::tokio::Api, Repo, RepoType};
 use model::ModelEngine;
@@ -50,8 +51,8 @@ pub struct Args {
     #[arg(short, long, default_value_t = 8080)]
     port: u16,
 
-    /// Device: "cpu", "cuda", or "metal"
-    #[arg(short, long, default_value = "cpu")]
+    /// Device: "auto", "cpu", "cuda", or "metal" (auto = try CUDA/Metal first)
+    #[arg(short, long, default_value = "auto")]
     device: String,
 
     /// CUDA device ordinal (when using --device cuda)
@@ -79,7 +80,7 @@ pub struct Args {
     api_key: String,
 
     /// Enable CORS for all origins
-    #[arg(long, default_value_t = false)]
+    #[arg(long, default_value_t = true)]
     cors: bool,
 
     /// Log level: trace, debug, info, warn, error
@@ -93,6 +94,8 @@ pub struct AppState {
     pub concurrency_semaphore: Semaphore,
     pub api_key: Option<String>,
     pub start_time: std::time::Instant,
+    pub created_timestamp: i64,
+    pub max_model_len: usize,
     pub request_count: std::sync::atomic::AtomicU64,
     pub tokens_generated: std::sync::atomic::AtomicU64,
 }
@@ -141,29 +144,26 @@ async fn main() -> std::io::Result<()> {
 
     // Handle model loading (either local file or from Hugging Face)
     let (model_path, tokenizer_path) = if let Some(hf_model_id) = &args.hf_model {
-        // Download model from Hugging Face
-        let (model_path, tokenizer_path) = download_hf_model(hf_model_id, &args.hf_filename, &args.hf_quant).await
+        let model_path = download_hf_model(hf_model_id, &args.hf_filename, &args.hf_quant).await
             .expect("Failed to download model from Hugging Face");
-        
         info!("Model path  : {}", model_path.display());
-        info!("Tokenizer   : {}", tokenizer_path.display());
-        
-        (model_path.to_string_lossy().to_string(), tokenizer_path.to_string_lossy().to_string())
+        (model_path.to_string_lossy().to_string(), args.tokenizer.clone())
     } else {
-        // Use local model file
-        let model_path = args.model.as_ref().expect("--model or --hf-model must be provided");
-        let tokenizer_path = args.tokenizer.as_ref().expect("--tokenizer must be provided when using --model");
-        
+        let model_path = args.model.as_ref().expect("--model or --hf-model must be provided").clone();
         info!("Model path  : {}", model_path);
-        info!("Tokenizer   : {}", tokenizer_path);
-        
-        (model_path.clone(), tokenizer_path.clone())
+        (model_path, args.tokenizer.clone())
     };
+
+    if let Some(ref tp) = tokenizer_path {
+        info!("Tokenizer   : {}", tp);
+    } else {
+        info!("Tokenizer   : embedded in GGUF");
+    }
 
     info!("Device      : {}", args.device);
     info!("Max concurrent: {}", args.max_concurrent);
 
-    let engine = ModelEngine::new(&model_path, &tokenizer_path, &device, args.ctx_len)
+    let engine = ModelEngine::new(&model_path, tokenizer_path.as_deref(), &device, args.ctx_len)
         .expect("Failed to load model");
 
     info!(
@@ -179,12 +179,15 @@ async fn main() -> std::io::Result<()> {
         Some(args.api_key.clone())
     };
 
+    let max_model_len = engine.ctx_len();
     let app_state = Arc::new(AppState {
         engine: tokio::sync::Mutex::new(engine),
         model_name: args.model_name.clone(),
         concurrency_semaphore: Semaphore::new(args.max_concurrent),
         api_key,
         start_time: std::time::Instant::now(),
+        created_timestamp: Utc::now().timestamp(),
+        max_model_len,
         request_count: std::sync::atomic::AtomicU64::new(0),
         tokens_generated: std::sync::atomic::AtomicU64::new(0),
     });
@@ -206,7 +209,7 @@ async fn main() -> std::io::Result<()> {
             .wrap(actix_middleware::Logger::new(
                 "%a \"%r\" %s %b %Dms",
             ))
-            .app_data(web::Data::from(app_state.clone()))
+            .app_data(web::Data::new(app_state.clone()))
             .app_data(web::JsonConfig::default().limit(4 * 1024 * 1024))
             // OpenAI-compatible routes
             .route("/v1/chat/completions", web::post().to(api::chat_completions))
@@ -225,7 +228,7 @@ async fn main() -> std::io::Result<()> {
     .await
 }
 
-async fn download_hf_model(model_id: &str, hf_filename: &str, preferred_quant: &str) -> anyhow::Result<(PathBuf, PathBuf)> {
+async fn download_hf_model(model_id: &str, hf_filename: &str, preferred_quant: &str) -> anyhow::Result<PathBuf> {
     let api = Api::new()?;
     let repo = Repo::new(model_id.to_string(), RepoType::Model);
     
@@ -267,60 +270,12 @@ async fn download_hf_model(model_id: &str, hf_filename: &str, preferred_quant: &
     let model_path = api.repo(repo.clone()).get(&gguf_filename).await
         .map_err(|e| anyhow::anyhow!("Failed to download model {}: {}", gguf_filename, e))?;
 
-    // Try to download the tokenizer as well
-    let tokenizer_path = match api.repo(repo.clone()).get("tokenizer.json").await {
-        Ok(path) => {
-            info!("Found and downloaded tokenizer.json from Hugging Face repo");
-            path
-        },
-        Err(_) => {
-            // Try alternative tokenizer files
-            let alt_files = ["tokenizer.model", "vocab.json"];
-            let mut found_tokenizer = None;
-            
-            for &filename in &alt_files {
-                if let Ok(path) = api.repo(repo.clone()).get(filename).await {
-                    info!("Found and downloaded {} from Hugging Face repo", filename);
-                    found_tokenizer = Some(path);
-                    break;
-                }
-            }
-            
-            if let Some(tokenizer_path) = found_tokenizer {
-                tokenizer_path
-            } else {
-                // If no tokenizer found, look for config to possibly generate one or warn
-                warn!("No tokenizer found in Hugging Face repo. Looking for config...");
-                
-                // Attempt to download config.json to see if we can extract tokenizer info
-                if let Ok(_config_path) = api.repo(repo.clone()).get("config.json").await {
-                    info!("Found config.json in Hugging Face repo");
-                    // For now, we still need a tokenizer file, so we'll use the one in the model directory
-                    // or prompt the user to provide one
-                }
-                
-                // Create a path for tokenizer in the same directory as the model
-                let mut tokenizer_path = model_path.clone();
-                tokenizer_path.set_file_name("tokenizer.json");
-                
-                // Check if tokenizer exists in the same directory as the model file
-                if !tokenizer_path.exists() {
-                    return Err(anyhow::anyhow!(
-                        "No tokenizer found in the Hugging Face repo and no tokenizer provided. \
-                         Please ensure tokenizer.json exists or provide one manually."
-                    ));
-                }
-                
-                tokenizer_path
-            }
-        }
-    };
-
-    Ok((model_path, tokenizer_path))
+    Ok(model_path)
 }
 
 fn build_device(args: &Args) -> candle_core::Device {
     match args.device.as_str() {
+        "auto" => try_gpu_or_cpu(args.device_id),
         "cuda" | "gpu" => {
             #[cfg(feature = "cuda")]
             {
@@ -345,6 +300,39 @@ fn build_device(args: &Args) -> candle_core::Device {
                 candle_core::Device::Cpu
             }
         }
-        _ => candle_core::Device::Cpu,
+        "cpu" => candle_core::Device::Cpu,
+        other => {
+            warn!("Unknown device '{}', falling back to auto-detect.", other);
+            try_gpu_or_cpu(args.device_id)
+        }
     }
+}
+
+fn try_gpu_or_cpu(_device_id: usize) -> candle_core::Device {
+    #[cfg(feature = "cuda")]
+    {
+        match candle_core::Device::new_cuda(_device_id) {
+            Ok(dev) => {
+                info!("Auto-detected CUDA device {}", _device_id);
+                return dev;
+            }
+            Err(e) => {
+                warn!("CUDA available at compile time but failed to init: {}", e);
+            }
+        }
+    }
+    #[cfg(feature = "metal")]
+    {
+        match candle_core::Device::new_metal(_device_id) {
+            Ok(dev) => {
+                info!("Auto-detected Metal device {}", _device_id);
+                return dev;
+            }
+            Err(e) => {
+                warn!("Metal available at compile time but failed to init: {}", e);
+            }
+        }
+    }
+    info!("Using CPU device");
+    candle_core::Device::Cpu
 }

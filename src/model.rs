@@ -1,8 +1,27 @@
 use candle_core::quantized::gguf_file;
+use candle_core::quantized::tokenizer::TokenizerFromGguf;
 use candle_core::{Device, Tensor};
-use candle_transformers::models::quantized_llama::ModelWeights;
+use candle_transformers::models::quantized_llama::ModelWeights as LlamaWeights;
+use candle_transformers::models::quantized_phi::ModelWeights as PhiWeights;
+use candle_transformers::models::quantized_phi3::ModelWeights as Phi3Weights;
 use tokenizers::Tokenizer;
 use tracing::{debug, info, warn};
+
+enum ModelArch {
+    Llama(LlamaWeights),
+    Phi2(PhiWeights),
+    Phi3(Phi3Weights),
+}
+
+impl ModelArch {
+    fn forward(&mut self, x: &Tensor, index_pos: usize) -> candle_core::Result<Tensor> {
+        match self {
+            Self::Llama(m) => m.forward(x, index_pos),
+            Self::Phi2(m) => m.forward(x, index_pos),
+            Self::Phi3(m) => m.forward(x, index_pos),
+        }
+    }
+}
 
 use crate::sampling::LogitsProcessor;
 
@@ -19,7 +38,7 @@ pub struct GenerationResult {
 
 /// Core model engine holding weights, tokenizer, and device.
 pub struct ModelEngine {
-    model: ModelWeights,
+    model: ModelArch,
     tokenizer: Tokenizer,
     device: Device,
     ctx_len: usize,
@@ -29,7 +48,7 @@ pub struct ModelEngine {
 impl ModelEngine {
     pub fn new(
         model_path: &str,
-        tokenizer_path: &str,
+        tokenizer_path: Option<&str>,
         device: &Device,
         ctx_len_override: usize,
     ) -> anyhow::Result<Self> {
@@ -56,11 +75,44 @@ impl ModelEngine {
         // Log some metadata if available
         Self::log_metadata(&content);
 
-        let model = ModelWeights::from_gguf(content, &mut file, device)
-            .map_err(|e| anyhow::anyhow!("Failed to load model weights: {}", e))?;
+        // Try to build tokenizer: explicit file > embedded in GGUF
+        let tokenizer = if let Some(path) = tokenizer_path {
+            info!("Loading tokenizer from file: {}", path);
+            Tokenizer::from_file(path)
+                .map_err(|e| anyhow::anyhow!("Failed to load tokenizer '{}': {}", path, e))?
+        } else {
+            info!("Extracting tokenizer from GGUF metadata");
+            Tokenizer::from_gguf(&content)
+                .map_err(|e| anyhow::anyhow!("Failed to extract tokenizer from GGUF: {}", e))?
+        };
 
-        let tokenizer = Tokenizer::from_file(tokenizer_path)
-            .map_err(|e| anyhow::anyhow!("Failed to load tokenizer '{}': {}", tokenizer_path, e))?;
+        let architecture = content
+            .metadata
+            .get("general.architecture")
+            .and_then(|v| match v {
+                gguf_file::Value::String(s) => Some(s.clone()),
+                _ => None,
+            })
+            .unwrap_or_default();
+        info!("Detected architecture: {}", architecture);
+
+        let model = match architecture.as_str() {
+            "phi2" => {
+                let weights = PhiWeights::from_gguf(content, &mut file, device)
+                    .map_err(|e| anyhow::anyhow!("Failed to load phi2 weights: {}", e))?;
+                ModelArch::Phi2(weights)
+            }
+            "phi3" => {
+                let weights = Phi3Weights::from_gguf(false, content, &mut file, device)
+                    .map_err(|e| anyhow::anyhow!("Failed to load phi3 weights: {}", e))?;
+                ModelArch::Phi3(weights)
+            }
+            _ => {
+                let weights = LlamaWeights::from_gguf(content, &mut file, device)
+                    .map_err(|e| anyhow::anyhow!("Failed to load model weights: {}", e))?;
+                ModelArch::Llama(weights)
+            }
+        };
 
         // Pre-compute all possible EOS token IDs
         let eos_candidates = [
@@ -446,6 +498,7 @@ impl ModelEngine {
             "general.context_length",
             "mistral.context_length",
             "qwen2.context_length",
+            "phi2.context_length",
             "phi3.context_length",
             "gemma.context_length",
         ];
