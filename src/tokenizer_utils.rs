@@ -1,6 +1,6 @@
 use tokenizers::Tokenizer;
 
-use crate::api::ChatMessage;
+use crate::dto::ChatMessage;
 
 #[derive(Debug, Clone, Copy)]
 pub enum ChatTemplate {
@@ -238,7 +238,7 @@ fn format_generic(messages: &[ChatMessage]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::ChatMessage;
+    use crate::dto::ChatMessage;
 
     fn msg(role: &str, content: &str) -> ChatMessage {
         ChatMessage {

@@ -1,7 +1,7 @@
 use actix_web::{HttpRequest, HttpResponse};
 use std::sync::Arc;
 
-use crate::api::{ErrorDetail, ErrorResponse};
+use crate::dto::{ErrorDetail, ErrorResponse};
 use crate::AppState;
 
 pub fn check_auth(req: &HttpRequest, state: &Arc<AppState>) -> Option<HttpResponse> {
