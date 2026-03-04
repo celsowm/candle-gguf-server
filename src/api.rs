@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_stream::StreamExt;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use crate::middleware::check_auth;
 use crate::tokenizer_utils::{apply_template, detect_template};
@@ -18,6 +18,12 @@ use crate::AppState;
 pub struct ChatMessage {
     pub role: String,
     pub content: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ChatTemplateKwargs {
+    #[serde(default)]
+    pub enable_thinking: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -51,6 +57,8 @@ pub struct ChatCompletionRequest {
     pub user: Option<String>,
     #[serde(default)]
     pub n: Option<usize>,
+    #[serde(default)]
+    pub chat_template_kwargs: Option<ChatTemplateKwargs>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -404,8 +412,12 @@ fn validate_completion_request(req: &CompletionRequest) -> Result<(), HttpRespon
 
 pub async fn health(state: web::Data<Arc<AppState>>) -> HttpResponse {
     let uptime = state.start_time.elapsed().as_secs();
-    let reqs = state.request_count.load(std::sync::atomic::Ordering::Relaxed);
-    let toks = state.tokens_generated.load(std::sync::atomic::Ordering::Relaxed);
+    let reqs = state
+        .request_count
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let toks = state
+        .tokens_generated
+        .load(std::sync::atomic::Ordering::Relaxed);
 
     HttpResponse::Ok().json(serde_json::json!({
         "status": "ok",
@@ -418,8 +430,12 @@ pub async fn health(state: web::Data<Arc<AppState>>) -> HttpResponse {
 
 pub async fn metrics(state: web::Data<Arc<AppState>>) -> HttpResponse {
     let uptime = state.start_time.elapsed().as_secs_f64();
-    let reqs = state.request_count.load(std::sync::atomic::Ordering::Relaxed);
-    let toks = state.tokens_generated.load(std::sync::atomic::Ordering::Relaxed);
+    let reqs = state
+        .request_count
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let toks = state
+        .tokens_generated
+        .load(std::sync::atomic::Ordering::Relaxed);
 
     // Prometheus-style plain text metrics
     let body = format!(
@@ -462,7 +478,10 @@ fn build_model_info(state: &AppState) -> ModelInfo {
         parent: None,
         max_model_len: state.max_model_len,
         permission: vec![ModelPermission {
-            id: format!("modelperm-{}", uuid::Uuid::new_v4().to_string().replace("-", "")),
+            id: format!(
+                "modelperm-{}",
+                uuid::Uuid::new_v4().to_string().replace("-", "")
+            ),
             object: "model_permission".to_string(),
             created,
             allow_create_engine: false,
@@ -485,10 +504,7 @@ pub async fn list_models(state: web::Data<Arc<AppState>>) -> HttpResponse {
     })
 }
 
-pub async fn get_model(
-    state: web::Data<Arc<AppState>>,
-    path: web::Path<String>,
-) -> HttpResponse {
+pub async fn get_model(state: web::Data<Arc<AppState>>, path: web::Path<String>) -> HttpResponse {
     let id = path.into_inner();
     if id == state.model_name {
         HttpResponse::Ok().json(build_model_info(&state))
@@ -523,11 +539,20 @@ pub async fn chat_completions(
     }
 
     let is_stream = req.stream.unwrap_or(false);
+    let model = state.model_name.clone();
     info!(
-        "POST /v1/chat/completions  stream={}  messages={}",
+        "POST /v1/chat/completions  stream={}  messages={}  model={}  chat_template_kwargs={}",
         is_stream,
-        req.messages.len()
+        req.messages.len(),
+        model,
+        req.chat_template_kwargs.is_some()
     );
+    if let Some(kwargs) = req.chat_template_kwargs.as_ref() {
+        info!(
+            "chat_template_kwargs received: enable_thinking={:?}",
+            kwargs.enable_thinking
+        );
+    }
 
     state.increment_requests();
 
@@ -544,18 +569,43 @@ pub async fn chat_completions(
 
     let params = GenParams::from_chat(&req);
     let id = request_id("chatcmpl");
-    let model = state.model_name.clone();
 
     let mut engine = state.engine.lock().await;
 
-    let template = detect_template(engine.tokenizer());
+    let template = detect_template(engine.tokenizer(), engine.architecture());
+    let template_name = template.to_string();
+    let architecture = engine.architecture().to_string();
     debug!("Detected chat template: {:?}", template);
     let prompt = apply_template(&req.messages, &template);
+    match engine.prompt_token_count(&prompt) {
+        Ok(prompt_tokens) => info!(
+            "Prepared chat generation  template={}  architecture={}  prompt_tokens={}  max_tokens={}",
+            template_name,
+            architecture,
+            prompt_tokens,
+            params.max_tokens
+        ),
+        Err(e) => warn!(
+            "Failed to count chat prompt tokens before generation  template={}  architecture={}  error={}",
+            template_name,
+            architecture,
+            e
+        ),
+    }
 
     if is_stream {
         drop(engine);
         let state_arc: Arc<AppState> = state.as_ref().clone();
-        return stream_chat_response(state_arc, prompt, params, id, model).await;
+        return stream_chat_response(
+            state_arc,
+            prompt,
+            params,
+            id,
+            model,
+            template_name,
+            architecture,
+        )
+        .await;
     }
 
     // Non-streaming
@@ -572,9 +622,22 @@ pub async fn chat_completions(
     ) {
         Ok(r) => {
             state.add_tokens(r.completion_tokens as u64);
+            if r.aborted_hidden_only {
+                warn!(
+                    "Hidden-only chat generation aborted early  request_id={}  model={}  template={}  architecture={}",
+                    id,
+                    model,
+                    template_name,
+                    architecture
+                );
+            }
             info!(
-                "Generated {} tokens in {}ms ({:.1} tok/s)",
-                r.completion_tokens, r.generation_time_ms, r.tokens_per_second
+                "Generated {} tokens in {}ms ({:.1} tok/s)  had_visible_output={}  aborted_hidden_only={}",
+                r.completion_tokens,
+                r.generation_time_ms,
+                r.tokens_per_second,
+                r.had_visible_output,
+                r.aborted_hidden_only
             );
 
             HttpResponse::Ok().json(ChatCompletionResponse {
@@ -616,6 +679,8 @@ async fn stream_chat_response(
     params: GenParams,
     id: String,
     model: String,
+    template_name: String,
+    architecture: String,
 ) -> HttpResponse {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Result<Bytes, String>>();
     let created = chrono::Utc::now().timestamp();
@@ -675,25 +740,48 @@ async fn stream_chat_response(
         );
 
         // Send final chunk
-        if let Ok(r) = &result {
-            let final_chunk = ChatCompletionChunk {
-                id: id.clone(),
-                object: "chat.completion.chunk".to_string(),
-                created,
-                model: model.clone(),
-                choices: vec![ChatChunkChoice {
-                    index: 0,
-                    delta: ChatDelta {
-                        role: None,
-                        content: None,
-                    },
-                    finish_reason: Some(r.finish_reason.clone()),
-                }],
-            };
-            let _ = tx.send(Ok(sse_line(&final_chunk)));
+        match &result {
+            Ok(r) => {
+                state.add_tokens(r.completion_tokens as u64);
+                if r.aborted_hidden_only {
+                    warn!(
+                        "Hidden-only chat stream aborted early  request_id={}  model={}  template={}  architecture={}",
+                        id,
+                        model,
+                        template_name,
+                        architecture
+                    );
+                }
+                info!(
+                    "Generated {} tokens in {}ms ({:.1} tok/s)  had_visible_output={}  aborted_hidden_only={}",
+                    r.completion_tokens,
+                    r.generation_time_ms,
+                    r.tokens_per_second,
+                    r.had_visible_output,
+                    r.aborted_hidden_only
+                );
+                let final_chunk = ChatCompletionChunk {
+                    id: id.clone(),
+                    object: "chat.completion.chunk".to_string(),
+                    created,
+                    model: model.clone(),
+                    choices: vec![ChatChunkChoice {
+                        index: 0,
+                        delta: ChatDelta {
+                            role: None,
+                            content: None,
+                        },
+                        finish_reason: Some(r.finish_reason.clone()),
+                    }],
+                };
+                let _ = tx.send(Ok(sse_line(&final_chunk)));
+            }
+            Err(e) => {
+                error!("Streaming generation error after SSE start: {:#}", e);
+            }
         }
         let _ = tx.send(Ok(sse_done()));
-        
+
         // Explicitly drop the sender to signal end of stream
         drop(tx);
     });
@@ -728,7 +816,11 @@ pub async fn completions(
     }
 
     let is_stream = req.stream.unwrap_or(false);
-    info!("POST /v1/completions  stream={}", is_stream);
+    let model = state.model_name.clone();
+    info!(
+        "POST /v1/completions  stream={}  model={}",
+        is_stream, model
+    );
 
     state.increment_requests();
 
@@ -745,13 +837,24 @@ pub async fn completions(
     let params = GenParams::from_completion(&req);
     let prompt = req.prompt.first();
     let id = request_id("cmpl");
-    let model = state.model_name.clone();
     let mut engine = state.engine.lock().await;
+    let architecture = engine.architecture().to_string();
+    match engine.prompt_token_count(&prompt) {
+        Ok(prompt_tokens) => info!(
+            "Prepared completion generation  architecture={}  prompt_tokens={}  max_tokens={}",
+            architecture, prompt_tokens, params.max_tokens
+        ),
+        Err(e) => warn!(
+            "Failed to count completion prompt tokens before generation  architecture={}  error={}",
+            architecture, e
+        ),
+    }
 
     if is_stream {
         drop(engine);
         let state_arc: Arc<AppState> = state.as_ref().clone();
-        return stream_completion_response(state_arc, prompt, params, id, model).await;
+        return stream_completion_response(state_arc, prompt, params, id, model, architecture)
+            .await;
     }
 
     match engine.generate(
@@ -767,9 +870,21 @@ pub async fn completions(
     ) {
         Ok(r) => {
             state.add_tokens(r.completion_tokens as u64);
+            if r.aborted_hidden_only {
+                warn!(
+                    "Hidden-only completion generation aborted early  request_id={}  model={}  architecture={}",
+                    id,
+                    model,
+                    architecture
+                );
+            }
             info!(
-                "Generated {} tokens in {}ms ({:.1} tok/s)",
-                r.completion_tokens, r.generation_time_ms, r.tokens_per_second
+                "Generated {} tokens in {}ms ({:.1} tok/s)  had_visible_output={}  aborted_hidden_only={}",
+                r.completion_tokens,
+                r.generation_time_ms,
+                r.tokens_per_second,
+                r.had_visible_output,
+                r.aborted_hidden_only
             );
 
             HttpResponse::Ok().json(CompletionResponse {
@@ -805,6 +920,7 @@ async fn stream_completion_response(
     params: GenParams,
     id: String,
     model: String,
+    architecture: String,
 ) -> HttpResponse {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Result<Bytes, String>>();
     let created = chrono::Utc::now().timestamp();
@@ -842,22 +958,44 @@ async fn stream_completion_response(
             },
         );
 
-        if let Ok(r) = &result {
-            let final_chunk = CompletionChunk {
-                id: id.clone(),
-                object: "text_completion".to_string(),
-                created,
-                model: model.clone(),
-                choices: vec![CompletionChunkChoice {
-                    index: 0,
-                    text: String::new(),
-                    finish_reason: Some(r.finish_reason.clone()),
-                }],
-            };
-            let _ = tx.send(Ok(sse_line(&final_chunk)));
+        match &result {
+            Ok(r) => {
+                state.add_tokens(r.completion_tokens as u64);
+                if r.aborted_hidden_only {
+                    warn!(
+                        "Hidden-only completion stream aborted early  request_id={}  model={}  architecture={}",
+                        id,
+                        model,
+                        architecture
+                    );
+                }
+                info!(
+                    "Generated {} tokens in {}ms ({:.1} tok/s)  had_visible_output={}  aborted_hidden_only={}",
+                    r.completion_tokens,
+                    r.generation_time_ms,
+                    r.tokens_per_second,
+                    r.had_visible_output,
+                    r.aborted_hidden_only
+                );
+                let final_chunk = CompletionChunk {
+                    id: id.clone(),
+                    object: "text_completion".to_string(),
+                    created,
+                    model: model.clone(),
+                    choices: vec![CompletionChunkChoice {
+                        index: 0,
+                        text: String::new(),
+                        finish_reason: Some(r.finish_reason.clone()),
+                    }],
+                };
+                let _ = tx.send(Ok(sse_line(&final_chunk)));
+            }
+            Err(e) => {
+                error!("Streaming completion error after SSE start: {:#}", e);
+            }
         }
         let _ = tx.send(Ok(sse_done()));
-        
+
         // Explicitly drop the sender to signal end of stream
         drop(tx);
     });
@@ -872,4 +1010,37 @@ async fn stream_completion_response(
         .insert_header(("Connection", "keep-alive"))
         .insert_header(("X-Accel-Buffering", "no"))
         .streaming(stream)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_chat_request_accepts_template_kwargs() {
+        let parsed: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "gguf-model",
+            "messages": [{"role": "user", "content": "ola"}],
+            "chat_template_kwargs": {"enable_thinking": false}
+        }))
+        .unwrap();
+
+        let kwargs = parsed
+            .chat_template_kwargs
+            .expect("missing chat_template_kwargs");
+        assert_eq!(kwargs.enable_thinking, Some(false));
+    }
+
+    #[test]
+    fn test_chat_request_ignores_unknown_fields() {
+        let parsed: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "gguf-model",
+            "messages": [{"role": "user", "content": "ola"}],
+            "unknown_field": "ignored"
+        }))
+        .unwrap();
+
+        assert_eq!(parsed.messages.len(), 1);
+        assert!(parsed.chat_template_kwargs.is_none());
+    }
 }

@@ -1,4 +1,4 @@
-use actix_web::{web, App, HttpResponse, HttpServer, middleware};
+use actix_web::{middleware, web, App, HttpResponse, HttpServer};
 use serde::Serialize;
 
 #[derive(Serialize)]
@@ -18,7 +18,7 @@ async fn health() -> HttpResponse {
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     println!("Starting server...");
-    
+
     HttpServer::new(|| {
         App::new()
             .wrap(middleware::Logger::default())

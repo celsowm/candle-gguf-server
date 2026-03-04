@@ -4,6 +4,7 @@ use candle_core::{Device, Tensor};
 use candle_transformers::models::quantized_llama::ModelWeights as LlamaWeights;
 use candle_transformers::models::quantized_phi::ModelWeights as PhiWeights;
 use candle_transformers::models::quantized_phi3::ModelWeights as Phi3Weights;
+use std::collections::{HashMap, HashSet};
 use tokenizers::Tokenizer;
 use tracing::{debug, info, warn};
 
@@ -34,6 +35,8 @@ pub struct GenerationResult {
     pub finish_reason: String,
     pub generation_time_ms: u128,
     pub tokens_per_second: f64,
+    pub had_visible_output: bool,
+    pub aborted_hidden_only: bool,
 }
 
 /// Core model engine holding weights, tokenizer, and device.
@@ -42,6 +45,7 @@ pub struct ModelEngine {
     tokenizer: Tokenizer,
     device: Device,
     ctx_len: usize,
+    architecture: String,
     eos_tokens: Vec<u32>,
 }
 
@@ -115,23 +119,14 @@ impl ModelEngine {
         };
 
         // Pre-compute all possible EOS token IDs
-        let eos_candidates = [
-            "</s>",
-            "",
-            "<|end|>",
-            "<|eot_id|>",
-            "</s>",
-            "<eos>",
-            "<|end_of_text|>",
-        ];
-        let eos_tokens: Vec<u32> = eos_candidates
-            .iter()
-            .filter_map(|t| tokenizer.token_to_id(t))
-            .collect();
+        let vocab = tokenizer.get_vocab(true);
+        let (eos_tokens, matched_eos_tokens) =
+            Self::resolve_eos_tokens(&vocab, &architecture, tokenizer.get_vocab_size(true));
 
         if eos_tokens.is_empty() {
             warn!("No EOS token found in tokenizer vocabulary!");
         } else {
+            info!("Matched EOS tokens: {:?}", matched_eos_tokens);
             info!("EOS token IDs: {:?}", eos_tokens);
         }
 
@@ -140,6 +135,7 @@ impl ModelEngine {
             tokenizer,
             device: device.clone(),
             ctx_len,
+            architecture,
             eos_tokens,
         })
     }
@@ -152,8 +148,16 @@ impl ModelEngine {
         self.ctx_len
     }
 
+    pub fn architecture(&self) -> &str {
+        &self.architecture
+    }
+
     pub fn tokenizer(&self) -> &Tokenizer {
         &self.tokenizer
+    }
+
+    pub fn prompt_token_count(&self, prompt: &str) -> anyhow::Result<usize> {
+        self.tokenize(prompt).map(|tokens| tokens.len())
     }
 
     /// Non-streaming generation.
@@ -181,6 +185,9 @@ impl ModelEngine {
         let mut all_tokens = prompt_tokens.clone();
         let mut generated_tokens: Vec<u32> = Vec::with_capacity(effective_max);
         let mut logits_proc = LogitsProcessor::new(seed, temperature, top_p, top_k);
+        let mut visibility = VisibilityState::default();
+        let mut aborted_hidden_only = false;
+        let hidden_only_abort_limit = self.hidden_only_abort_limit();
 
         // Reset KV cache for fresh generation
         // Note: Clearing KV cache might require different approach in newer candle version
@@ -198,31 +205,71 @@ impl ModelEngine {
         generated_tokens.push(next);
         all_tokens.push(next);
 
+        if !self.is_eos(next) {
+            let delta = self.next_text_delta(&generated_tokens, &mut visibility.prev_text_len)?;
+            visibility.record(delta.is_some());
+            if visibility.should_abort_hidden_only(hidden_only_abort_limit) {
+                aborted_hidden_only = true;
+            }
+        }
+
         // === Decode loop ===
-        for i in 1..effective_max {
-            if self.is_eos(next) {
-                break;
+        if !aborted_hidden_only {
+            for i in 1..effective_max {
+                if self.is_eos(next) {
+                    break;
+                }
+
+                if self.check_stop_sequences(&generated_tokens, stop_sequences)? {
+                    break;
+                }
+
+                let input = Tensor::new(&[next], &self.device)?.unsqueeze(0)?;
+                let logits = self.model.forward(&input, prompt_len + i)?;
+                let logits = self.extract_last_logits(&logits)?;
+                let logits = Self::apply_repeat_penalty(
+                    &logits,
+                    repeat_penalty,
+                    &all_tokens,
+                    repeat_last_n,
+                )?;
+
+                next = logits_proc.sample(&logits)?;
+                generated_tokens.push(next);
+                all_tokens.push(next);
+
+                if self.is_eos(next) {
+                    break;
+                }
+
+                let delta =
+                    self.next_text_delta(&generated_tokens, &mut visibility.prev_text_len)?;
+                visibility.record(delta.is_some());
+                if visibility.should_abort_hidden_only(hidden_only_abort_limit) {
+                    aborted_hidden_only = true;
+                    warn!(
+                        "Aborting hidden-only generation early: architecture={} prompt_tokens={} sampled_tokens={} hidden_token_limit={}",
+                        self.architecture,
+                        prompt_len,
+                        generated_tokens.len(),
+                        hidden_only_abort_limit
+                    );
+                    break;
+                }
             }
-
-            if self.check_stop_sequences(&generated_tokens, stop_sequences)? {
-                break;
-            }
-
-            let input = Tensor::new(&[next], &self.device)?.unsqueeze(0)?;
-            let logits = self.model.forward(&input, prompt_len + i)?;
-            let logits = self.extract_last_logits(&logits)?;
-            let logits =
-                Self::apply_repeat_penalty(&logits, repeat_penalty, &all_tokens, repeat_last_n)?;
-
-            next = logits_proc.sample(&logits)?;
-            generated_tokens.push(next);
-            all_tokens.push(next);
         }
 
         let elapsed = start.elapsed();
-        let text = self.decode_tokens(&generated_tokens)?;
-        let (final_text, finish_reason) =
-            Self::trim_stop_sequences(text, generated_tokens.len(), effective_max, stop_sequences);
+        let text = if aborted_hidden_only {
+            String::new()
+        } else {
+            self.decode_tokens(&generated_tokens)?
+        };
+        let (final_text, finish_reason) = if aborted_hidden_only {
+            (String::new(), "stop".to_string())
+        } else {
+            Self::trim_stop_sequences(text, generated_tokens.len(), effective_max, stop_sequences)
+        };
 
         let tps = if elapsed.as_secs_f64() > 0.0 {
             generated_tokens.len() as f64 / elapsed.as_secs_f64()
@@ -244,6 +291,8 @@ impl ModelEngine {
             finish_reason,
             generation_time_ms: elapsed.as_millis(),
             tokens_per_second: tps,
+            had_visible_output: visibility.had_visible_output(),
+            aborted_hidden_only,
         })
     }
 
@@ -277,8 +326,10 @@ impl ModelEngine {
         let mut all_tokens = prompt_tokens.clone();
         let mut generated_tokens: Vec<u32> = Vec::with_capacity(effective_max);
         let mut logits_proc = LogitsProcessor::new(seed, temperature, top_p, top_k);
-        let mut prev_text_len: usize = 0;
+        let mut visibility = VisibilityState::default();
         let mut cancelled = false;
+        let mut aborted_hidden_only = false;
+        let hidden_only_abort_limit = self.hidden_only_abort_limit();
 
         // self.model.clear_kv_cache(); // Commented out due to API change in newer candle version
 
@@ -294,15 +345,28 @@ impl ModelEngine {
         all_tokens.push(next);
 
         if !self.is_eos(next) {
-            cancelled = !self.emit_incremental_delta(
+            let (emitted, keep_going) = self.emit_incremental_delta(
                 &generated_tokens,
-                &mut prev_text_len,
+                &mut visibility.prev_text_len,
                 &mut on_token,
             )?;
+            visibility.record(emitted);
+            if visibility.should_abort_hidden_only(hidden_only_abort_limit) {
+                aborted_hidden_only = true;
+                warn!(
+                    "Aborting hidden-only streaming generation early: architecture={} prompt_tokens={} sampled_tokens={} hidden_token_limit={}",
+                    self.architecture,
+                    prompt_len,
+                    generated_tokens.len(),
+                    hidden_only_abort_limit
+                );
+            } else {
+                cancelled = !keep_going;
+            }
         }
 
         // === Decode loop ===
-        if !cancelled && !self.is_eos(next) {
+        if !cancelled && !aborted_hidden_only && !self.is_eos(next) {
             for i in 1..effective_max {
                 if self.check_stop_sequences(&generated_tokens, stop_sequences)? {
                     break;
@@ -326,11 +390,26 @@ impl ModelEngine {
                     break;
                 }
 
-                if !self.emit_incremental_delta(
+                let (emitted, keep_going) = self.emit_incremental_delta(
                     &generated_tokens,
-                    &mut prev_text_len,
+                    &mut visibility.prev_text_len,
                     &mut on_token,
-                )? {
+                )?;
+                visibility.record(emitted);
+
+                if visibility.should_abort_hidden_only(hidden_only_abort_limit) {
+                    aborted_hidden_only = true;
+                    warn!(
+                        "Aborting hidden-only streaming generation early: architecture={} prompt_tokens={} sampled_tokens={} hidden_token_limit={}",
+                        self.architecture,
+                        prompt_len,
+                        generated_tokens.len(),
+                        hidden_only_abort_limit
+                    );
+                    break;
+                }
+
+                if !keep_going {
                     cancelled = true;
                     break;
                 }
@@ -338,8 +417,14 @@ impl ModelEngine {
         }
 
         let elapsed = start.elapsed();
-        let full_text = self.decode_tokens(&generated_tokens)?;
-        let (final_text, finish_reason) = if cancelled {
+        let full_text = if aborted_hidden_only {
+            String::new()
+        } else {
+            self.decode_tokens(&generated_tokens)?
+        };
+        let (final_text, finish_reason) = if aborted_hidden_only {
+            (String::new(), "stop".to_string())
+        } else if cancelled {
             (full_text, "stop".to_string())
         } else {
             Self::trim_stop_sequences(
@@ -363,6 +448,8 @@ impl ModelEngine {
             finish_reason,
             generation_time_ms: elapsed.as_millis(),
             tokens_per_second: tps,
+            had_visible_output: visibility.had_visible_output(),
+            aborted_hidden_only,
         })
     }
 
@@ -415,29 +502,88 @@ impl ModelEngine {
         Ok(logits.get(last_idx)?)
     }
 
+    fn resolve_eos_tokens(
+        vocab: &HashMap<String, u32>,
+        architecture: &str,
+        vocab_size: usize,
+    ) -> (Vec<u32>, Vec<&'static str>) {
+        let eos_candidates = [
+            "</s>",
+            "<|endoftext|>",
+            "<|end|>",
+            "<|eot_id|>",
+            "<eos>",
+            "<|end_of_text|>",
+        ];
+        let mut seen = HashSet::new();
+        let mut ids = Vec::new();
+        let mut matched_tokens = Vec::new();
+
+        for token in eos_candidates {
+            if let Some(id) = vocab.get(token).copied() {
+                if seen.insert(id) {
+                    ids.push(id);
+                }
+                matched_tokens.push(token);
+            }
+        }
+
+        if ids.is_empty() && architecture == "phi2" {
+            let phi2_eos = 50_256_u32;
+            if (phi2_eos as usize) < vocab_size && seen.insert(phi2_eos) {
+                ids.push(phi2_eos);
+                matched_tokens.push("<|endoftext|>#fallback(50256)");
+            }
+        }
+
+        (ids, matched_tokens)
+    }
+
+    fn next_text_delta(
+        &self,
+        generated: &[u32],
+        prev_text_len: &mut usize,
+    ) -> anyhow::Result<Option<String>> {
+        let current = self.decode_tokens(generated)?;
+        let current_len = current.len();
+        let delta = if current_len > *prev_text_len {
+            let delta = &current[*prev_text_len..];
+            if delta.is_empty() {
+                None
+            } else {
+                Some(delta.to_string())
+            }
+        } else {
+            None
+        };
+        *prev_text_len = current_len;
+        Ok(delta)
+    }
+
+    fn hidden_only_abort_limit(&self) -> usize {
+        if self.architecture == "phi2" {
+            PHI2_MAX_HIDDEN_TOKENS_WITHOUT_VISIBLE_OUTPUT
+        } else {
+            DEFAULT_MAX_HIDDEN_TOKENS_WITHOUT_VISIBLE_OUTPUT
+        }
+    }
+
     /// Emit the new characters since `prev_text_len` to the callback.
-    /// Returns `true` to continue, `false` to cancel.
+    /// Returns `(emitted_visible_delta, keep_going)`.
     fn emit_incremental_delta<F>(
         &self,
         generated: &[u32],
         prev_text_len: &mut usize,
         on_token: &mut F,
-    ) -> anyhow::Result<bool>
+    ) -> anyhow::Result<(bool, bool)>
     where
         F: FnMut(&str) -> bool,
     {
-        let current = self.decode_tokens(generated)?;
-        let current_len = current.len();
-        if current_len > *prev_text_len {
-            let delta = &current[*prev_text_len..];
-            if !delta.is_empty() {
-                let keep_going = on_token(delta);
-                *prev_text_len = current_len;
-                return Ok(keep_going);
-            }
+        if let Some(delta) = self.next_text_delta(generated, prev_text_len)? {
+            let keep_going = on_token(&delta);
+            return Ok((true, keep_going));
         }
-        *prev_text_len = current_len;
-        Ok(true)
+        Ok((false, true))
     }
 
     fn check_stop_sequences(
@@ -527,5 +673,77 @@ impl ModelEngine {
                 info!("GGUF metadata: {} = {:?}", key, val);
             }
         }
+    }
+}
+
+const DEFAULT_MAX_HIDDEN_TOKENS_WITHOUT_VISIBLE_OUTPUT: usize = 4;
+const PHI2_MAX_HIDDEN_TOKENS_WITHOUT_VISIBLE_OUTPUT: usize = 1;
+
+#[derive(Debug, Default)]
+struct VisibilityState {
+    prev_text_len: usize,
+    visible_emissions: usize,
+    consecutive_non_emitting_tokens: usize,
+}
+
+impl VisibilityState {
+    fn record(&mut self, emitted_visible_delta: bool) {
+        if emitted_visible_delta {
+            self.visible_emissions += 1;
+            self.consecutive_non_emitting_tokens = 0;
+        } else {
+            self.consecutive_non_emitting_tokens += 1;
+        }
+    }
+
+    fn had_visible_output(&self) -> bool {
+        self.visible_emissions > 0
+    }
+
+    fn should_abort_hidden_only(&self, limit: usize) -> bool {
+        self.visible_emissions == 0 && self.consecutive_non_emitting_tokens >= limit
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_resolve_eos_tokens_deduplicates_and_matches() {
+        let vocab = HashMap::from([
+            ("</s>".to_string(), 2_u32),
+            ("<|end|>".to_string(), 2_u32),
+            ("<eos>".to_string(), 5_u32),
+        ]);
+
+        let (ids, matched) = ModelEngine::resolve_eos_tokens(&vocab, "llama", 32_000);
+
+        assert_eq!(ids, vec![2, 5]);
+        assert_eq!(matched, vec!["</s>", "<|end|>", "<eos>"]);
+    }
+
+    #[test]
+    fn test_resolve_eos_tokens_uses_phi2_fallback() {
+        let vocab = HashMap::new();
+
+        let (ids, matched) = ModelEngine::resolve_eos_tokens(&vocab, "phi2", 60_000);
+
+        assert_eq!(ids, vec![50_256]);
+        assert_eq!(matched, vec!["<|endoftext|>#fallback(50256)"]);
+    }
+
+    #[test]
+    fn test_visibility_state_aborts_hidden_only_after_threshold() {
+        let mut visibility = VisibilityState::default();
+
+        for _ in 0..DEFAULT_MAX_HIDDEN_TOKENS_WITHOUT_VISIBLE_OUTPUT {
+            visibility.record(false);
+        }
+
+        assert!(!visibility.had_visible_output());
+        assert!(
+            visibility.should_abort_hidden_only(DEFAULT_MAX_HIDDEN_TOKENS_WITHOUT_VISIBLE_OUTPUT)
+        );
     }
 }

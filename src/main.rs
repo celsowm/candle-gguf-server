@@ -5,7 +5,7 @@ mod sampling;
 mod tokenizer_utils;
 
 use actix_cors::Cors;
-use actix_web::{web, App, HttpServer, middleware as actix_middleware};
+use actix_web::{middleware as actix_middleware, web, App, HttpServer};
 use chrono::Utc;
 use clap::Parser;
 use hf_hub::{api::tokio::Api, Repo, RepoType};
@@ -117,13 +117,15 @@ async fn main() -> std::io::Result<()> {
     let args = Args::parse();
 
     tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::from_default_env()
-                .add_directive(args.log_level.parse().unwrap_or_else(|_| {
-                    warn!("Invalid log level '{}', defaulting to 'info'", args.log_level);
-                    "info".parse().unwrap()
-                })),
-        )
+        .with_env_filter(EnvFilter::from_default_env().add_directive(
+            args.log_level.parse().unwrap_or_else(|_| {
+                warn!(
+                    "Invalid log level '{}', defaulting to 'info'",
+                    args.log_level
+                );
+                "info".parse().unwrap()
+            }),
+        ))
         .with_target(false)
         .with_thread_ids(true)
         .init();
@@ -144,12 +146,20 @@ async fn main() -> std::io::Result<()> {
 
     // Handle model loading (either local file or from Hugging Face)
     let (model_path, tokenizer_path) = if let Some(hf_model_id) = &args.hf_model {
-        let model_path = download_hf_model(hf_model_id, &args.hf_filename, &args.hf_quant).await
+        let model_path = download_hf_model(hf_model_id, &args.hf_filename, &args.hf_quant)
+            .await
             .expect("Failed to download model from Hugging Face");
         info!("Model path  : {}", model_path.display());
-        (model_path.to_string_lossy().to_string(), args.tokenizer.clone())
+        (
+            model_path.to_string_lossy().to_string(),
+            args.tokenizer.clone(),
+        )
     } else {
-        let model_path = args.model.as_ref().expect("--model or --hf-model must be provided").clone();
+        let model_path = args
+            .model
+            .as_ref()
+            .expect("--model or --hf-model must be provided")
+            .clone();
         info!("Model path  : {}", model_path);
         (model_path, args.tokenizer.clone())
     };
@@ -163,8 +173,13 @@ async fn main() -> std::io::Result<()> {
     info!("Device      : {}", args.device);
     info!("Max concurrent: {}", args.max_concurrent);
 
-    let engine = ModelEngine::new(&model_path, tokenizer_path.as_deref(), &device, args.ctx_len)
-        .expect("Failed to load model");
+    let engine = ModelEngine::new(
+        &model_path,
+        tokenizer_path.as_deref(),
+        &device,
+        args.ctx_len,
+    )
+    .expect("Failed to load model");
 
     info!(
         "Model loaded — vocab size: {}, ctx_len: {}",
@@ -206,13 +221,14 @@ async fn main() -> std::io::Result<()> {
 
         App::new()
             .wrap(cors)
-            .wrap(actix_middleware::Logger::new(
-                "%a \"%r\" %s %b %Dms",
-            ))
+            .wrap(actix_middleware::Logger::new("%a \"%r\" %s %b %Dms"))
             .app_data(web::Data::new(app_state.clone()))
             .app_data(web::JsonConfig::default().limit(4 * 1024 * 1024))
             // OpenAI-compatible routes
-            .route("/v1/chat/completions", web::post().to(api::chat_completions))
+            .route(
+                "/v1/chat/completions",
+                web::post().to(api::chat_completions),
+            )
             .route("/v1/completions", web::post().to(api::completions))
             .route("/v1/models", web::get().to(api::list_models))
             .route("/v1/models/{model_id}", web::get().to(api::get_model))
@@ -222,27 +238,35 @@ async fn main() -> std::io::Result<()> {
             // Catch-all for 404
             .default_service(web::to(api::not_found))
     })
-    .workers(num_cpus::get())  // Use number of CPU cores for workers
+    .workers(num_cpus::get()) // Use number of CPU cores for workers
     .bind(&bind_addr)?
     .run()
     .await
 }
 
-async fn download_hf_model(model_id: &str, hf_filename: &str, preferred_quant: &str) -> anyhow::Result<PathBuf> {
+async fn download_hf_model(
+    model_id: &str,
+    hf_filename: &str,
+    preferred_quant: &str,
+) -> anyhow::Result<PathBuf> {
     let api = Api::new()?;
     let repo = Repo::new(model_id.to_string(), RepoType::Model);
-    
+
     // If no specific filename provided, look for .gguf files in the repository
     let gguf_filename = if hf_filename.is_empty() {
-        let repo_info = api.repo(repo.clone()).info().await
+        let repo_info = api
+            .repo(repo.clone())
+            .info()
+            .await
             .map_err(|e| anyhow::anyhow!("Failed to get repo info for {}: {}", model_id, e))?;
-        
-        let gguf_files: Vec<&str> = repo_info.siblings
+
+        let gguf_files: Vec<&str> = repo_info
+            .siblings
             .iter()
             .map(|s| s.rfilename.as_str())
             .filter(|name| name.ends_with(".gguf"))
             .collect();
-        
+
         match gguf_files.len() {
             0 => return Err(anyhow::anyhow!(
                 "No .gguf files found in repository '{}'. This repo may not contain GGUF-format models. \
@@ -265,9 +289,12 @@ async fn download_hf_model(model_id: &str, hf_filename: &str, preferred_quant: &
     } else {
         hf_filename.to_string()
     };
-    
+
     info!("Downloading GGUF model file: {}", gguf_filename);
-    let model_path = api.repo(repo.clone()).get(&gguf_filename).await
+    let model_path = api
+        .repo(repo.clone())
+        .get(&gguf_filename)
+        .await
         .map_err(|e| anyhow::anyhow!("Failed to download model {}: {}", gguf_filename, e))?;
 
     Ok(model_path)
@@ -296,7 +323,9 @@ fn build_device(args: &Args) -> candle_core::Device {
             }
             #[cfg(not(feature = "metal"))]
             {
-                warn!("Metal requested but not compiled with 'metal' feature. Falling back to CPU.");
+                warn!(
+                    "Metal requested but not compiled with 'metal' feature. Falling back to CPU."
+                );
                 candle_core::Device::Cpu
             }
         }

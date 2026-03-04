@@ -8,6 +8,7 @@ pub enum ChatTemplate {
     Llama2,
     Llama3,
     Gemma,
+    Phi2Base,
     Phi3,
     Zephyr,
     Mistral,
@@ -20,8 +21,8 @@ impl std::fmt::Display for ChatTemplate {
     }
 }
 
-/// Auto-detect chat template from the tokenizer vocabulary.
-pub fn detect_template(tokenizer: &Tokenizer) -> ChatTemplate {
+/// Auto-detect chat template from the tokenizer vocabulary and model architecture.
+pub fn detect_template(tokenizer: &Tokenizer, architecture: &str) -> ChatTemplate {
     let vocab = tokenizer.get_vocab(true);
 
     if vocab.contains_key("<|im_start|>") && vocab.contains_key("<|im_end|>") {
@@ -58,6 +59,10 @@ pub fn detect_template(tokenizer: &Tokenizer) -> ChatTemplate {
         return ChatTemplate::Zephyr;
     }
 
+    if architecture == "phi2" {
+        return ChatTemplate::Phi2Base;
+    }
+
     ChatTemplate::Generic
 }
 
@@ -68,6 +73,7 @@ pub fn apply_template(messages: &[ChatMessage], template: &ChatTemplate) -> Stri
         ChatTemplate::Llama2 => format_llama2(messages),
         ChatTemplate::Llama3 => format_llama3(messages),
         ChatTemplate::Gemma => format_gemma(messages),
+        ChatTemplate::Phi2Base => format_phi2_base(messages),
         ChatTemplate::Phi3 => format_phi3(messages),
         ChatTemplate::Zephyr => format_zephyr(messages),
         ChatTemplate::Mistral => format_mistral(messages),
@@ -151,6 +157,20 @@ fn format_gemma(messages: &[ChatMessage]) -> String {
         ));
     }
     out.push_str("<start_of_turn>model\n");
+    out
+}
+
+fn format_phi2_base(messages: &[ChatMessage]) -> String {
+    let mut out = String::new();
+    for m in messages {
+        match m.role.as_str() {
+            "system" => out.push_str(&format!("System: {}\n", m.content)),
+            "user" => out.push_str(&format!("Instruct: {}\n", m.content)),
+            "assistant" => out.push_str(&format!("Output: {}\n", m.content)),
+            _ => {}
+        }
+    }
+    out.push_str("Output:");
     out
 }
 
@@ -260,5 +280,21 @@ mod tests {
         let result = format_generic(&messages);
         assert!(result.contains("### User:"));
         assert!(result.ends_with("### Assistant:\n"));
+    }
+
+    #[test]
+    fn test_phi2_base_format() {
+        let messages = vec![msg("system", "be concise"), msg("user", "ola")];
+        let result = format_phi2_base(&messages);
+        assert!(result.contains("System: be concise\n"));
+        assert!(result.contains("Instruct: ola\n"));
+        assert!(result.ends_with("Output:"));
+    }
+
+    #[test]
+    fn test_detect_phi2_base_template() {
+        let tokenizer = Tokenizer::new(tokenizers::models::wordlevel::WordLevel::default());
+        let template = detect_template(&tokenizer, "phi2");
+        assert!(matches!(template, ChatTemplate::Phi2Base));
     }
 }
